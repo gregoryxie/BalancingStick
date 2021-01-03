@@ -7,6 +7,14 @@
 
 // #define PRINT_DATA
 
+enum ControllerState {
+   IDLE,
+   ACTIVE,
+   STOPPED
+};
+
+ControllerState currentState;
+
 MPU6050 mpu;
 C610Bus bus;
 
@@ -25,17 +33,17 @@ float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container
 
 bool blink_state = false;
 
-long last_print_time;
-long last_command_time;
+long lastPrintTime;
+long lastCommandTime;
 
-const int print_delay = 20000;
-const int command_delay = 10000;
+const int printDelay = 20000;
+const int commandDelay = 10000;
 
 int16_t ax, ay, az, gx, gy, gz;
-float yaw, pitch, roll, roll_rate, pitch_rate;
-float meas_pitch_motor_vel, meas_roll_motor_vel, meas_pitch_motor_torque, meas_roll_motor_torque;
+float yaw, pitch, roll, rollRate, pitchRate;
+float measPitchMotorVel, measRollMotorVel, measPitchMotorTorque, measRollMotorTorque;
 
-float filt_roll = 0.0, filt_pitch = 0.0, filt_roll_rate = 0.0, filt_pitch_rate = 0.0;
+float filtRoll = 0.0, filtPitch = 0.0, filtRollRate = 0.0, filtPitchRate = 0.0;
 float alpha = 0.25, alpha2 = 0.25;
 
 using namespace BLA;
@@ -47,15 +55,93 @@ Matrix<6,1> x;
 Matrix<2,1> u;
 Matrix<2,1> r = {0, 0};
 
-const float inv_torque_constant = 5555.55; // 1/0.00018 mA/Nm
-int cmd_pitch_motor_current, cmd_roll_motor_current;
-float cmd_pitch_torque, cmd_roll_torque;
-const float max_torque = 1.5;
+const float invTorqueConstant = 5555.55; // 1/0.00018 mA/Nm
+int cmdPitchMotorCurrent, cmdRollMotorCurrent;
+float cmdPitchTorque, cmdRollTorque;
+const float maxTorque = 1.5;
 
 volatile bool mpuInterrupt = false;
 
 void dmpDataReady() {
   mpuInterrupt = true;
+}
+
+void changeState(ControllerState nextState) {
+   if (nextState == IDLE) {
+      bus.CommandTorques(0, 0, 0, 0, C610Subbus::kIDZeroToThree);
+      digitalWrite(LED_BUILTIN, true);
+   } else if (nextState == ACTIVE) {
+      digitalWrite(LED_BUILTIN, false);
+   }
+   currentState = nextState;
+}
+
+bool readIMU() {
+   if (!mpuInterrupt && fifoCount < packetSize) {
+    return false;
+   }
+
+   mpuInterrupt = false;
+   mpuIntStatus = mpu.getIntStatus();
+   fifoCount = mpu.getFIFOCount();
+
+   if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+      mpu.resetFIFO();
+   }
+   else if (mpuIntStatus & 0x02 && millis() > 5000) {
+
+      while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+      mpu.getFIFOBytes(fifoBuffer, packetSize);
+      fifoCount -= packetSize;
+      mpu.dmpGetQuaternion(&q, fifoBuffer);
+      mpu.dmpGetGravity(&gravity, &q);
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+      yaw = ypr[0];
+      pitch = -1*ypr[1];
+      roll =  ypr[2];
+
+      mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+      // Scaling for +/- 2000 degrees/s full scale range
+      pitchRate = 1 * gy / 16.4 * M_PI / 180.0;
+      rollRate = 1 * gx / 16.4  * M_PI / 180.0;
+      return true;
+   }
+   return false;
+}
+
+void printData() {
+   #ifdef PRINT_DATA
+      Serial.print(x(0));
+      Serial.print("\t");
+      Serial.print(x(1));
+      Serial.print("\t");
+      Serial.print(x(2));
+      Serial.print("\t");
+      Serial.print(x(3));
+      Serial.print("\t");
+      Serial.print(x(4));
+      Serial.print("\t");
+      Serial.print(x(5));
+      Serial.print("\t");
+      Serial.print(x(cmdRollTorque));
+      Serial.print("\t");
+      Serial.print(x(cmdPitchTorque));
+      Serial.print("\t");
+      Serial.println(millis());
+   #else
+      Serial.write((byte *) &x(0), 4);
+      Serial.write((byte *) &x(1), 4);
+      Serial.write((byte *) &x(2), 4);
+      Serial.write((byte *) &x(3), 4);
+      Serial.write((byte *) &x(4), 4);
+      Serial.write((byte *) &x(5), 4);
+      Serial.write((byte *) &cmdRollTorque, 4);
+      Serial.write((byte *) &cmdPitchTorque, 4);
+      Serial.write((byte *) &measRollMotorTorque, 4);
+      Serial.write((byte *) &measPitchMotorTorque, 4);
+   #endif
 }
 
 void setup() {
@@ -95,122 +181,70 @@ void setup() {
 
    pinMode(LED_BUILTIN, OUTPUT);
 
-   last_print_time = micros();
-   last_command_time = micros();
+   changeState(IDLE);
+   lastPrintTime = micros();
+   lastCommandTime = micros();
 }
 
 void loop() {
    if (!dmpReady){
+      changeState(STOPPED);
+   }
+
+   if (currentState == STOPPED) {
       return;
-   }
+   } else if (currentState == ACTIVE) {
+      if (readIMU()) {
+         if (fabs(pitch) < 0.3 && fabs(roll) < 0.3) {
+            filtRoll = alpha * roll + (1 - alpha) * filtRoll;
+            filtPitch = alpha * pitch + (1 - alpha) * filtPitch;
 
-   while (!mpuInterrupt && fifoCount < packetSize) {
-    ;
-  }
+            filtRollRate = alpha2 * rollRate + (1 - alpha2) * filtRollRate;
+            filtPitchRate = alpha2 * pitchRate + (1 - alpha2) * filtPitchRate;
 
-  mpuInterrupt = false;
-  mpuIntStatus = mpu.getIntStatus();
-  fifoCount = mpu.getFIFOCount();
+            measRollMotorVel = bus.Get(0).Velocity()/50.0;
+            measPitchMotorVel = bus.Get(1).Velocity()/50.0;
 
-   if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-      mpu.resetFIFO();
-   }
-   else if (mpuIntStatus & 0x02 && millis() > 5000) {
+            measRollMotorTorque = -1*bus.Get(0).Torque();
+            measPitchMotorTorque = -1*bus.Get(1).Torque();
 
-      while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+            // Update state vector
+            x << filtPitch, filtPitchRate, measPitchMotorVel, filtRoll, filtRollRate, measRollMotorVel;
 
-      mpu.getFIFOBytes(fifoBuffer, packetSize);
-      fifoCount -= packetSize;
-      mpu.dmpGetQuaternion(&q, fifoBuffer);
-      mpu.dmpGetGravity(&gravity, &q);
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+            // Control law of u = r-Kx
+            u = r-K*x;
 
-      yaw = ypr[0];
-      pitch = -1*ypr[1];
-      roll =  ypr[2];
+            cmdRollTorque = constrain(u(0), -1*maxTorque, maxTorque);
+            cmdPitchTorque = constrain(u(1), -1*maxTorque, maxTorque);
 
-      filt_roll = alpha * roll + (1 - alpha) * filt_roll;
-      filt_pitch = alpha * pitch + (1 - alpha) * filt_pitch;
+            cmdRollMotorCurrent = (int) (-1*cmdRollTorque*invTorqueConstant);
+            cmdPitchMotorCurrent = (int) (-1*cmdPitchTorque*invTorqueConstant);
 
-      if (fabs(pitch) < 0.3 && fabs(roll) < 0.3) {
-         mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-         // Scaling for +/- 2000 degrees/s full scale range
-         pitch_rate = 1 * gy / 16.4 * M_PI / 180.0;
-         roll_rate = 1 * gx / 16.4  * M_PI / 180.0;
+            if (fabs(measRollMotorVel) > 40 || fabs(measPitchMotorVel) > 40) {
+               digitalWrite(LED_BUILTIN, true);
+            } else {
+               digitalWrite(LED_BUILTIN, false);
+            }
 
-         filt_roll_rate = alpha2 * roll_rate + (1 - alpha2) * filt_roll_rate;
-         filt_pitch_rate = alpha2 * pitch_rate + (1 - alpha2) * filt_pitch_rate;
+            if (micros() - lastCommandTime > commandDelay) {
+               //cmdRollMotorCurrent = max_current*sin(micros()/1000000.0);
+               bus.CommandTorques(cmdRollMotorCurrent, cmdPitchMotorCurrent, 0, 0, C610Subbus::kIDZeroToThree);
+               lastCommandTime = micros();
+            }
 
-         meas_roll_motor_vel = bus.Get(0).Velocity()/50.0;
-         meas_pitch_motor_vel = bus.Get(1).Velocity()/50.0;
-
-         meas_roll_motor_torque = -1*bus.Get(0).Torque();
-         meas_pitch_motor_torque = -1*bus.Get(1).Torque();
-
-         // Update state vector
-         x << filt_pitch, filt_pitch_rate, meas_pitch_motor_vel, filt_roll, filt_roll_rate, meas_roll_motor_vel;
-
-         // Control law of u = r-Kx
-         u = r-K*x;
-
-         cmd_roll_torque = constrain(u(0), -1*max_torque, max_torque);
-         cmd_pitch_torque = constrain(u(1), -1*max_torque, max_torque);
-
-         cmd_roll_motor_current = (int) (-1*cmd_roll_torque*inv_torque_constant);
-         cmd_pitch_motor_current = (int) (-1*cmd_pitch_torque*inv_torque_constant);
-
-         if (fabs(meas_roll_motor_vel) > 40 || fabs(meas_pitch_motor_vel) > 40) {
-            digitalWrite(LED_BUILTIN, true);
+            if (micros() - lastPrintTime > printDelay) {
+               printData();
+               lastPrintTime = micros();
+            }
          } else {
-            digitalWrite(LED_BUILTIN, false);
-         }
-
-         if (micros() - last_command_time > command_delay) {
-            //cmd_roll_motor_current = max_current*sin(micros()/1000000.0);
-            bus.CommandTorques(cmd_roll_motor_current, cmd_pitch_motor_current, 0, 0, C610Subbus::kIDZeroToThree);
-            last_command_time = micros();
-         }
-
-         if (micros() - last_print_time > print_delay) {
-            #ifdef PRINT_DATA
-               Serial.print(pitch);
-               Serial.print("\t");
-               Serial.print(pitch_rate);
-               Serial.print("\t");
-               Serial.print(pitch_motor_vel);
-               Serial.print("\t");
-               Serial.print(roll);
-               Serial.print("\t");
-               Serial.print(roll_rate);
-               Serial.print("\t");
-               Serial.print(roll_motor_vel);
-               Serial.print("\t");
-               Serial.print(roll_motor_current);
-               Serial.print("\t");
-               Serial.print(pitch_motor_current);
-               Serial.print("\t");
-               Serial.println(millis());
-            #else
-               Serial.write((byte *) &x(0), 4);
-               Serial.write((byte *) &x(1), 4);
-               Serial.write((byte *) &x(2), 4);
-               Serial.write((byte *) &x(3), 4);
-               Serial.write((byte *) &x(4), 4);
-               Serial.write((byte *) &x(5), 4);
-               Serial.write((byte *) &cmd_roll_torque, 4);
-               Serial.write((byte *) &cmd_pitch_torque, 4);
-               Serial.write((byte *) &meas_roll_motor_torque, 4);
-               Serial.write((byte *) &meas_pitch_motor_torque, 4);
-            #endif
-            last_print_time = micros();
+            changeState(IDLE);
          }
       }
-      else {
-         bus.CommandTorques(0, 0, 0, 0, C610Subbus::kIDZeroToThree);
-         digitalWrite(LED_BUILTIN, true);
-         // while (true) {
-
-         // }
+   } else {
+      if (readIMU()) {
+         if (fabs(pitch) < 0.1 && fabs(roll) < 0.1) {
+            changeState(ACTIVE);
+         }
       }
    }
 }
