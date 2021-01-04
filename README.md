@@ -4,7 +4,7 @@
 ## Overview
 Double reaction wheel balancing stick, using 2 pairs of DJI's M2006/C610 motor controller and ESC combo. 
 
-![It balances!](imgs/balancing.jpg?raw=true)
+![It balances!](imgs/balancing_lower_res.jpg?raw=true)
 
 Video of the stick balancing: https://www.youtube.com/watch?v=M8iMUHhxG7U
 
