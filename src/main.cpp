@@ -5,12 +5,12 @@
 #include <BasicLinearAlgebra.h>
 #include "Wire.h"
 
-// #define PRINT_DATA
+// #define PRINT_DATA   // Define for human readable serial output, comment out for MATLAB serial readable
 
 enum ControllerState {
-   IDLE,
-   ACTIVE,
-   STOPPED
+   IDLE,    // Controller is not balancing, but will try to balance if close to upright
+   ACTIVE,  // Controller is trying to balance
+   STOPPED  // Controller is not balancing, will not try to balance
 };
 
 ControllerState currentState;
@@ -46,8 +46,8 @@ int16_t ax, ay, az, gx, gy, gz;
 float yaw, pitch, roll, rollRate, pitchRate;
 float measPitchMotorVel, measRollMotorVel, measPitchMotorTorque, measRollMotorTorque;
 
-float filtRoll = 0.0, filtPitch = 0.0, filtRollRate = 0.0, filtPitchRate = 0.0;
-float alpha = 0.25, alpha2 = 0.35;
+float filtRollRate = 0.0, filtPitchRate = 0.0;
+float alpha = 0.35;
 
 const float invTorqueConstant = 5555.55; // 1/0.00018 mA/Nm
 int cmdPitchMotorCurrent, cmdRollMotorCurrent;
@@ -55,7 +55,8 @@ float cmdPitchTorque, cmdRollTorque;
 const float maxTorque = 1.5;
 
 float qRoll = 0.0, qPitch = 0.0;
-const float maxWindup = 200;
+const float maxWindup = 200;     // Max windup for wheel velocity integrator, increase if the IMU zero is
+                                 // far away from equilibrium
 
 using namespace BLA;
 
@@ -76,7 +77,8 @@ void dmpDataReady() {
 }
 
 void changeState(ControllerState nextState) {
-   if (nextState == IDLE) {
+   // Helper function to change state
+   if (nextState == IDLE || nextState == STOPPED) {
       bus.CommandTorques(0, 0, 0, 0, C610Subbus::kIDZeroToThree);
       digitalWrite(LED_BUILTIN, true);
    } else if (nextState == ACTIVE) {
@@ -90,6 +92,10 @@ void changeState(ControllerState nextState) {
 }
 
 bool readIMU() {
+   // Attempts to get IMU data and put into corresponding variables, controller only uses 
+   //    pitch, roll, pitchRate, rollRate. 
+   // If there is no data to get, returns false, otherwise return true.
+
    if (!mpuInterrupt && fifoCount < packetSize) {
     return false;
    }
@@ -166,13 +172,6 @@ void setup() {
    mpu.initialize();
    devStatus = mpu.dmpInitialize();
 
-   mpu.setXAccelOffset(-2566);
-   mpu.setYAccelOffset(-1537);
-   mpu.setZAccelOffset(950);
-   mpu.setXGyroOffset(15);
-   mpu.setYGyroOffset(-16);
-   mpu.setZGyroOffset(57);
-
    mpu.setXAccelOffset(-2570);
    mpu.setYAccelOffset(-1476);
    mpu.setZAccelOffset(790);
@@ -180,19 +179,11 @@ void setup() {
    mpu.setYGyroOffset(-46);
    mpu.setZGyroOffset(-92);
 
-   // mpu.setXAccelOffset(-2316);
-   // mpu.setYAccelOffset(-1313);
-   // mpu.setZAccelOffset(1014);
-   // mpu.setXGyroOffset(24);
-   // mpu.setYGyroOffset(-28);
-   // mpu.setZGyroOffset(110);
-
    attachInterrupt(digitalPinToInterrupt(IMU_pin), dmpDataReady, RISING);
 
 
    if (devStatus == 0) {
       mpu.setDMPEnabled(true);
-
       dmpReady = true;
       packetSize = mpu.dmpGetFIFOPacketSize();
    } else {
@@ -222,23 +213,22 @@ void loop() {
 
             controlLoopDeltaT = (float) (currentControlLoopTime - lastControlLoopTime) * 0.000001;
 
-            filtRoll = roll;//alpha * roll + (1 - alpha) * filtRoll;
-            filtPitch = pitch;//alpha * pitch + (1 - alpha) * filtPitch;
-
-            filtRollRate = alpha2 * rollRate + (1 - alpha2) * filtRollRate;
-            filtPitchRate = alpha2 * pitchRate + (1 - alpha2) * filtPitchRate;
+            // Gyro measurements super noisy, first order low pass
+            filtRollRate = alpha * rollRate + (1 - alpha) * filtRollRate;
+            filtPitchRate = alpha * pitchRate + (1 - alpha) * filtPitchRate;
 
             measRollMotorVel = bus.Get(0).Velocity();
             measPitchMotorVel = bus.Get(1).Velocity();
 
-            qRoll = constrain(qRoll + -1*measRollMotorVel * controlLoopDeltaT, -1*maxWindup, maxWindup);
-            qPitch = constrain(qPitch + -1*measPitchMotorVel * controlLoopDeltaT, -1*maxWindup, maxWindup);
-
             measRollMotorTorque = -1*bus.Get(0).Torque();
             measPitchMotorTorque = -1*bus.Get(1).Torque();
 
+            // Integrator on wheel velocity
+            qRoll = constrain(qRoll + -1*measRollMotorVel * controlLoopDeltaT, -1*maxWindup, maxWindup);
+            qPitch = constrain(qPitch + -1*measPitchMotorVel * controlLoopDeltaT, -1*maxWindup, maxWindup);
+
             // Update state vector
-            x << filtPitch, filtPitchRate, measPitchMotorVel, qPitch, filtRoll, filtRollRate, measRollMotorVel, qRoll;
+            x << pitch, filtPitchRate, measPitchMotorVel, qPitch, roll, filtRollRate, measRollMotorVel, qRoll;
 
             // Control law of u = r-Kx
             u = r-K*x;
@@ -256,7 +246,6 @@ void loop() {
             }
 
             if (currentControlLoopTime - lastCommandTime > commandDelay) {
-               //cmdRollMotorCurrent = max_current*sin(micros()/1000000.0);
                bus.CommandTorques(cmdRollMotorCurrent, cmdPitchMotorCurrent, 0, 0, C610Subbus::kIDZeroToThree);
                lastCommandTime = currentControlLoopTime;
             }
@@ -273,7 +262,7 @@ void loop() {
       }
    } else {
       if (readIMU()) {
-         if (fabs(pitch) < 0.03 && fabs(roll) < 0.03) {
+         if (fabs(pitch) < 0.1 && fabs(roll) < 0.1) {
             changeState(ACTIVE);
          }
       }
