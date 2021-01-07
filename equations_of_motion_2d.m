@@ -126,7 +126,10 @@ simulationTime = 5;
 sampleFreq = 500;
 timeVector = (0:1:sampleFreq*simulationTime)/sampleFreq;
 
+% K(1,4) = 0; %% remove integrator
+% K(2,8) = 0
 [t, x] = ode45(@(t,x) flight_simulator(t, x, feqn_phi, feqn_theta, K), timeVector, x0);
+
 
 % Get states
 theta1 = x(:,1);
@@ -202,8 +205,8 @@ ddtheta1 = feqn_theta(u(1), theta1);
 ddtheta2 = feqn_theta(u(2), theta2);
 ddphi1 = feqn_phi(u(1));
 ddphi2 = feqn_phi(u(2));
-dq1 = -q1;
-dq2 = -q2;
+dq1 = -dphi1;
+dq2 = -dphi2;
 
 dxdt = [dtheta1; ddtheta1; ddphi1; dq1; dtheta2; ddtheta2; ddphi2; dq2];
 end
